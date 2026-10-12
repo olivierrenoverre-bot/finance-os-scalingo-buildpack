@@ -1,0 +1,4 @@
+#!/bin/sh
+# Finance OS SHADOW : l'archive de déploiement porte le verrou à empreintes et l'entrée fos.
+[ -f "$1/cash_guard/requirements.lock" ] && [ -f "$1/deploy/finance_os/fos-entrypoint.sh" ] && echo "Finance OS (Python 3.9.6)" && exit 0
+exit 1

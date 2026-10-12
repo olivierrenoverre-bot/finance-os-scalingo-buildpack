@@ -1,0 +1,94 @@
+#!/bin/sh
+# Buildpack Scalingo — runtime Finance OS SHADOW, aligné sur l'image validée (deploy/finance_os/Dockerfile).
+#   bin/compile BUILD_DIR CACHE_DIR ENV_DIR
+# Même interpréteur (CPython 3.9.6, binaire autonome épinglé par empreinte), même verrou à empreintes (pip --require-hashes),
+# venv sans site système au même schéma que le Mac, même entrée fos. AUCUNE donnée, AUCUN secret.
+# Minimisation : seule la liste blanche de l'image validée (Dockerfile.dockerignore) est conservée ; tout le reste est supprimé.
+set -eu
+BUILD=$1; CACHE=$2; ENVDIR=${3:-}
+APP=/app                                                # chemin d'exécution sur Scalingo
+PY_URL=https://github.com/astral-sh/python-build-standalone/releases/download/20210724/cpython-3.9.6-x86_64-unknown-linux-gnu-install_only-20210724T1424.tar.gz
+PY_SHA=a5e1f952a50a3a660922a7b558911d56c4d046078c67a83ec048f81ee4d3b8bd
+LOCK_SHA=e87bda3065d31c19903921202bea8698850c6c966f529054eb8f5276e20eb63a   # = PACKAGE.json requirements_lock_sha256 (374d81d4102b)
+# Couche de persistance (étape 2) : restic épinglé (SHA256SUMS de la release officielle) ; venv d'infrastructure SÉPARÉ.
+RESTIC_URL=https://github.com/restic/restic/releases/download/v0.17.3/restic_0.17.3_linux_amd64.bz2
+RESTIC_SHA=5097faeda6aa13167aae6e36efdba636637f8741fed89bbf015678334632d4d3
+# Miroir contrôlé de l'artefact Python (archive O'Santé) : variable d'environnement FOS_PYTHON_MIRROR (URL), même empreinte.
+PY_MIRROR=$( [ -n "$ENVDIR" ] && [ -f "$ENVDIR/FOS_PYTHON_MIRROR" ] && cat "$ENVDIR/FOS_PYTHON_MIRROR" || true)
+say() { echo "-----> $*"; }
+fail() { echo " !     $*" >&2; exit 1; }
+
+[ "$(uname -m)" = x86_64 ] || fail "architecture non prise en charge : $(uname -m)"
+cd "$BUILD"
+[ "$(sha256sum cash_guard/requirements.lock | cut -d' ' -f1)" = "$LOCK_SHA" ] || fail "verrou de dépendances différent du package de référence"
+
+say "Minimisation : liste blanche de l'image validée"
+KEEP=$(mktemp -d)
+mkdir -p "$KEEP/cash_guard" "$KEEP/deploy/finance_os"
+cp cash_guard/requirements.lock "$KEEP/cash_guard/"
+cp deploy/finance_os/fos-entrypoint.sh "$KEEP/deploy/finance_os/"
+mkdir -p "$KEEP/fos_runtime"; cp -R deploy/scalingo/runtime "$KEEP/fos_runtime/runtime"; cp deploy/scalingo/requirements-infra.lock deploy/scalingo/launch.py "$KEEP/fos_runtime/"
+cp -R finance_os "$KEEP/"
+rm -rf "$KEEP/finance_os/ui/fixtures" "$KEEP/finance_os/ui_fixtures.py"
+find "$KEEP" \( -name '__pycache__' -o -name '*.pyc' \) -prune -exec rm -rf {} +
+find "$BUILD" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+cp -R "$KEEP/." "$BUILD/"; rm -rf "$KEEP"
+
+say "CPython 3.9.6 (binaire autonome, empreinte vérifiée)"
+mkdir -p "$CACHE"; TGZ="$CACHE/$(basename "$PY_URL")"
+fetch() { [ -f "$2" ] && [ "$(sha256sum "$2" | cut -d' ' -f1)" = "$3" ] && return 0; curl -fsSL --retry 3 -o "$2" "$1" || true; }
+[ -n "$PY_MIRROR" ] && fetch "$PY_MIRROR" "$TGZ" "$PY_SHA"
+fetch "$PY_URL" "$TGZ" "$PY_SHA"
+[ "$(sha256sum "$TGZ" | cut -d' ' -f1)" = "$PY_SHA" ] || fail "empreinte de l'interpréteur incorrecte"
+mkdir -p "$BUILD/.fos-python"; tar -xzf "$TGZ" -C "$BUILD/.fos-python" --strip-components=1
+PY="$BUILD/.fos-python/bin/python3.9"
+[ "$("$PY" -c 'import sys;print(sys.version.split()[0])')" = 3.9.6 ] || fail "interpréteur ≠ 3.9.6"
+
+say "venv + dépendances depuis le verrou à empreintes"
+"$PY" -m venv "$BUILD/.venv"
+"$BUILD/.venv/bin/python" -m pip install --no-cache-dir --disable-pip-version-check --require-hashes -r cash_guard/requirements.lock
+find "$BUILD/.venv" -name '__pycache__' -prune -exec rm -rf {} +
+# venv relocalisé vers /app (Scalingo construit ailleurs puis déplace l'application) : lien relatif, home réécrit.
+ln -sfn ../../.fos-python/bin/python3.9 "$BUILD/.venv/bin/python"
+sed -i "s#^home = .*#home = $APP/.fos-python/bin#" "$BUILD/.venv/pyvenv.cfg"
+
+say "Couche de persistance : venv d'infrastructure (séparé) + restic"
+"$PY" -m venv "$BUILD/.infra-venv"
+"$BUILD/.infra-venv/bin/python" -m pip install --no-cache-dir --disable-pip-version-check --require-hashes -r "$BUILD/fos_runtime/requirements-infra.lock"
+find "$BUILD/.infra-venv" -name '__pycache__' -prune -exec rm -rf {} +
+ln -sfn ../../.fos-python/bin/python3.9 "$BUILD/.infra-venv/bin/python"
+sed -i "s#^home = .*#home = $APP/.fos-python/bin#" "$BUILD/.infra-venv/pyvenv.cfg"
+RBZ="$CACHE/$(basename "$RESTIC_URL")"
+fetch "$RESTIC_URL" "$RBZ" "$RESTIC_SHA"
+[ "$(sha256sum "$RBZ" | cut -d' ' -f1)" = "$RESTIC_SHA" ] || fail "empreinte de restic incorrecte"
+mkdir -p "$BUILD/bin"
+"$PY" -c 'import bz2,sys;open(sys.argv[2],"wb").write(bz2.open(sys.argv[1]).read())' "$RBZ" "$BUILD/bin/restic"
+chmod 0555 "$BUILD/bin/restic"
+find "$BUILD/fos_runtime" -type f -exec chmod a-w {} +
+
+say "Entrée fos (celle de l'image validée, chemin du venv seul adapté)"
+mkdir -p "$BUILD/bin"
+sed "s#/opt/venv/bin/python#$APP/.venv/bin/python#" deploy/finance_os/fos-entrypoint.sh > "$BUILD/bin/fos"
+chmod 0555 "$BUILD/bin/fos"
+
+say "Environnement d'exécution (mêmes valeurs que l'image validée ; chemins sous /app)"
+mkdir -p "$BUILD/.profile.d"
+cat > "$BUILD/.profile.d/finance-os.sh" <<ENV
+export LANG=C.UTF-8 TZ=UTC BUSINESS_TZ=America/Martinique
+export FOS_ROOT=\${FOS_ROOT:-$APP/srv}
+export OSANTE_CG_STORE=\$FOS_ROOT/store FOS_WORK=\$FOS_ROOT/work FOS_READMODEL=\$FOS_ROOT/readmodel/readmodel.json
+export FOS_BACKUP=\$FOS_ROOT/backup FOS_INBOX=\$FOS_ROOT/inbox OG_DECLARED_INPUTS=\$FOS_ROOT/store/declared_inputs
+export FOS_OG_OUT=\$FOS_ROOT/work/obligation_guard/latest/obligation_guard.json
+export FOS_RUNTIME=SERVER FOS_SERVER_MODE=SHADOW FOS_PRIMARY_RUNTIME=MAC
+export FINANCE_OS_SECRET_PROVIDER=SERVER_SECRET_STORE FINANCE_OS_SECRETS_DIR=\${FINANCE_OS_SECRETS_DIR:-$APP/run/secrets}
+export FOS_API_INTERNAL_PORT=\${FOS_API_INTERNAL_PORT:-8081} FOS_PROXY_HOST=0.0.0.0 FOS_REQUIRE_HTTPS=\${FOS_REQUIRE_HTTPS:-1}
+export PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=$APP
+export FOS_RESTIC=$APP/bin/restic FOS_APP=$APP FOS_SERVED=\${FOS_SERVED:-$APP/served} FOS_STATE_DIR=\${FOS_STATE_DIR:-$APP/state}
+export PATH=$APP/bin:$APP/.venv/bin:\$PATH
+ENV
+find "$BUILD/finance_os" -type f -exec chmod a-w {} +
+
+say "Contrôle : runtime"
+"$BUILD/.venv/bin/python" -c 'import sys,ssl,sqlite3,zoneinfo,openpyxl,pypdf,yaml;print(sys.version.split()[0],ssl.OPENSSL_VERSION,"sqlite",sqlite3.sqlite_version)'
+"$BUILD/.infra-venv/bin/python" -c 'import pg8000;print("pg8000",pg8000.__version__)'
+"$BUILD/bin/restic" version

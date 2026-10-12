@@ -1,0 +1,7 @@
+#!/bin/sh
+# Processus web : superviseur (lecteur / écrivain unique) + portail authentifié sur $PORT. Scalingo charge .profile.d avant.
+cat <<'YAML'
+---
+default_process_types:
+  web: /app/.infra-venv/bin/python -I -B /app/fos_runtime/launch.py run
+YAML
